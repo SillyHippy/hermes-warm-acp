@@ -185,9 +185,13 @@ class WarmACPClient:
     # -- warm request driver -----------------------------------------------
     def _drive_session(
         self, *, timeout_seconds: float, model: str | None = None, prompt_text: str | None = None,
-        allow_file_requests: bool = True, discovery: bool = False,
+        allow_file_requests: bool = True, discovery: bool = False, on_chunk=None,
     ) -> tuple[Any, ...]:
-        """Run one ACP session on a warm proc: new session → model → prompt → close."""
+        """Run one ACP session on a warm proc: new session → model → prompt → close.
+
+        ``on_chunk``: optional callback invoked with each live agent text chunk
+        (str) as it arrives over session/update — implements real streaming.
+        """
         from agent.acp_client import (
             _INITIALIZE_PARAMS, _model_selection_request, _session_model_ids, logger,
         )
@@ -219,7 +223,7 @@ class WarmACPClient:
                         continue
                     if self._handle(msg, process=proc, cwd=tpl._acp_cwd,
                                     text_parts=text_parts, reasoning_parts=reasoning_parts,
-                                    allow_file_requests=allow_file_requests):
+                                    allow_file_requests=allow_file_requests, on_chunk=on_chunk):
                         continue
                     if msg.get("id") != request_id:
                         continue
@@ -279,8 +283,23 @@ class WarmACPClient:
         finally:
             self._release_slot(slot, healthy=healthy)
 
-    def _handle(self, msg, *, process, cwd: str, text_parts, reasoning_parts, allow_file_requests: bool) -> bool:
-        """Delegate every server->client message to the base-class bridge verbatim."""
+    def _handle(self, msg, *, process, cwd: str, text_parts, reasoning_parts, allow_file_requests: bool,
+                on_chunk=None) -> bool:
+        """Delegate every server->client message to the base-class bridge verbatim.
+
+        When ``on_chunk`` is set, live agent_message_chunk text is ALSO forwarded
+        to the callback as it lands (real streaming), in addition to the normal
+        buffering."""
+        if on_chunk is not None and isinstance(msg, dict) and msg.get("method") == "session/update":
+            update = (msg.get("params") or {}).get("update") or {}
+            if str(update.get("sessionUpdate") or "") == "agent_message_chunk":
+                content = update.get("content") or {}
+                chunk_text = str(content.get("text") or "") if isinstance(content, dict) else ""
+                if chunk_text:
+                    try:
+                        on_chunk(chunk_text)
+                    except Exception:
+                        pass
         tpl = self._template_cached
         return tpl._handle_server_message(
             msg, process=process, cwd=cwd, text_parts=text_parts, reasoning_parts=reasoning_parts,
@@ -293,16 +312,70 @@ class WarmACPClient:
             self._tpl_cache = self._template()
         return self._tpl_cache
 
+    def _drive_streaming_session(self, *, timeout_seconds: float, model: str | None = None,
+                                 prompt_text: str | None = None) -> tuple[str, str]:
+        """Same turn as _drive_session, but yields live chunk callbacks through a
+        blocking queue so the gateway's stream consumer sees text as it lands."""
+        result_holder: dict[str, Any] = {}
+        result_evt = threading.Event()
+
+        def _on_chunk(chunk: str) -> None:
+            result_holder.setdefault("chunks", []).append((time.monotonic(), chunk))
+
+        def _work() -> None:
+            try:
+                text, reasoning = self._drive_session(
+                    timeout_seconds=timeout_seconds, model=model, prompt_text=prompt_text,
+                    on_chunk=_on_chunk,
+                )
+                result_holder["final"] = (text, reasoning)
+            except BaseException as exc:  # surface every failure shape to the consumer
+                result_holder["error"] = exc
+            finally:
+                result_evt.set()
+
+        worker = threading.Thread(target=_work, daemon=True)
+        self._stream_state = result_holder
+        worker.start()
+
+        # Emit chunks as they land (backed by a small poll loop); the outer
+        # generator yields each live chunk, then the final assembled text.
+        emitted = 0
+        while not result_evt.is_set():
+            chunks_now = result_holder.get("chunks") or []
+            while emitted < len(chunks_now):
+                _, chunk_text = chunks_now[emitted]
+                emitted += 1
+                yield chunk_text
+            time.sleep(0.05)
+        # drain any remaining chunks recorded before the event
+        chunks_now = result_holder.get("chunks") or []
+        while emitted < len(chunks_now):
+            _, chunk_text = chunks_now[emitted]
+            emitted += 1
+            yield chunk_text
+        if "error" in result_holder:
+            raise result_holder["error"]
+        text, reasoning = result_holder.get("final") or ("", "")
+        # final text may exceed the sum of observed chunks (tool-call turns): the
+        # gateway joins chunks itself, so hand back the authoritative full text.
+        result_holder["final_text"], result_holder["final_reasoning"] = text, reasoning
+
     # -- OpenAI facade -------------------------------------------------------
     def _create_chat_completion(self, *, model: str | None = None, messages: list[dict[str, Any]] | None = None,
-                                timeout: float | None = None, **__: Any) -> Any:
+                                timeout: float | None = None, stream: bool = False, **__: Any) -> Any:
         from agent.acp_client import _effective_timeout, _extract_tool_calls_from_text, _completion_to_stream_chunks
 
         messages = messages or []
         prompt_text = _format_messages_as_prompt(messages, model=model)
-        text, reasoning = self._drive_session(
-            timeout_seconds=_effective_timeout(timeout), model=model, prompt_text=prompt_text,
-        )
+        if stream:
+            text, reasoning = self._drive_streaming_session(
+                timeout_seconds=_effective_timeout(timeout), model=model, prompt_text=prompt_text,
+            )
+        else:
+            text, reasoning = self._drive_session(
+                timeout_seconds=_effective_timeout(timeout), model=model, prompt_text=prompt_text,
+            )
         tool_calls, cleaned_text = _extract_tool_calls_from_text(text)
         from types import SimpleNamespace
 
@@ -316,7 +389,7 @@ class WarmACPClient:
                                   prompt_tokens_details=SimpleNamespace(cached_tokens=0)),
             model=model or "mistral-large-4-0",
         )
-        return completion
+        return _completion_to_stream_chunks(completion) if stream else completion
 
     def list_models(self, *, timeout_seconds: float = 15.0) -> list[str]:
         """Model discovery over the warm process (no throwaway spawn)."""
