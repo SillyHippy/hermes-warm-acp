@@ -1,0 +1,5 @@
+name: mistral-vibe-acp-provider
+kind: model-provider
+version: 1.0.0
+description: Mistral Vibe CLI over ACP (acp://mistral-vibe-acp) — bills the Vibe allowance, not API credit
+author: local

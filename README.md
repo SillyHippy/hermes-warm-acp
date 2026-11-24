@@ -1,70 +1,103 @@
-# hermes-warm-acp
+# Hermes Mistral Vibe ACP
 
-Keep-warm ACP client for [Hermes Agent](https://hermes-agent.nousresearch.com) model-provider plugins.
+Complete Hermes provider for Mistral Vibe ACP, including the warm ACP session client and Vibe-key rotator.
 
-## The problem
+This is one Mistral-specific package. It is not a generic ACP framework.
 
-Hermes' generic `ACPClient` spawns a **fresh agent-harness subprocess per chat turn**: spawn → `initialize` → `session/new` → prompt → kill. Measured on Mistral's `vibe-acp` (mistral-vibe 3.1.4), that handshake chain costs **~4.8–5.0s of pure overhead on every message**:
+## What it does
 
-| Step (cold turn) | ms |
-|---|---:|
-| OS fork/exec | ~2 |
-| `initialize` RPC | ~2,400 |
-| `session/new` | ~1,800 (≈1,300 warm) |
-| model select | ~600 |
-+ model inference (varies, 1.2–20s under Mistral load)
+Hermes talks to Mistral's `vibe-acp` harness over ACP. The provider keeps one warm harness process, opens a fresh ACP session for each turn, and rotates across the `mistral-vibe` credential pool when a key hits auth, billing, or capacity failure.
 
-The ACP protocol was designed for the opposite: **the editor boots the agent once and runs many sessions on that one process** (Zed, JetBrains). The harnesses want to be reused — the per-turn teardown is a client-side habit, not a protocol limit.
+Measured cold handshake overhead is about 4.8–5.0 seconds:
 
-## The fix
+- process spawn: about 2 ms
+- `initialize`: about 2,400 ms
+- `session/new`: about 1,800 ms cold, about 1,300 ms warm
+- model select: about 600 ms
 
-`WarmACPClient` (see `mistral_vibe_acp_provider.py`) keeps **one long-lived harness process per slot**:
+The warm client pays `initialize` once per process. Later turns pay `session/new`, model select, and model time.
 
-- `initialize` **once** per process
-- a **fresh ACP session per turn** (`session/new` → model select → `session/prompt` → `session/close`) — context flow is identical to the cold path, so the host's checkpoint-pruned active window is still what crosses the wire
-- any request error (billing 402/2304, capacity 429/3505, auth 401) **poisons the slot** → killed → next checkout respawns through the key rotator (next live pool key)
-- `is_closed` stays `False` while a warm worker is idle, so host lifecycle code doesn't `close()` the pool after turn 1
-- `close()` tears the pool down
+## Install
 
-Warm turns measure **~2.6–4.8s total** (session/new ~1.3s + model reply) vs ~5s of setup overhead + reply on the cold path. `list_models()` over the warm process: **~0.9s** (was a full throwaway spawn).
+Install the harness:
 
-## Crash recovery
+```bash
+uv tool install --python 3.14 mistral-vibe
+```
 
-SIGKILLed the warm process mid-life → next turn auto-respawned and answered in 10.5s (one-time cold cost). Idle workers found dead at checkout are dropped and respawned.
+Copy these paths onto the Hermes box:
 
-## Design constraints honored (from the live repo)
+- `model-providers/mistral-vibe-acp/` to `~/.hermes/plugins/model-providers/mistral-vibe-acp/`
+- `scripts/vibe_acp_rotator.py` to `~/.hermes/scripts/vibe_acp_rotator.py`
 
-- **Zero changes to the generic `ACPClient`** — this is a plugin-side facade that reuses the base class's tested request plumbing, message bridge (`_handle_server_message`), and formatter. The base class's invariant tests (31/31) stay green; every other ACP provider keeps today's behavior.
-- **Don't reuse one ACP session across turns** unless you also change prompt formatting — resending the full transcript into a session that already holds it doubles the history.
-- Key rotation cannot swap a key inside a live harness process (auth is baked into env at spawn) — hence poison-and-respawn, not in-place rotation.
+The plugin command is pinned to the Hermes venv interpreter because the rotator imports Hermes' credential pool and `ruamel.yaml`. If that interpreter path differs on another box, change `_COMMAND` in `model-providers/mistral-vibe-acp/__init__.py` to the interpreter that can import `ruamel`.
 
-## Files
+Add the Vibe pool keys with `hermes auth add`, under provider `mistral-vibe`.
 
-- `mistral_vibe_acp_provider.py` — drop-in Hermes provider plugin (`model-providers/mistral-vibe-acp/__init__.py`)
-- `vibe_acp_rotator.py` — selects the next live key from the host's credential pool, spawns the harness with it, and benches/rotates on 401/402/429
+Add this provider block:
 
-## Interpreter requirement
+```yaml
+providers:
+  mistral-vibe-acp:
+    name: Mistral Vibe ACP
+    base_url: acp://mistral-vibe-acp
+    discover_models: false
+    enabled: true
+    request_timeout_seconds: 300
+    stale_timeout_seconds: 300
+    models:
+      - mistral-vibe-acp/mistral-large-4-0
+      - mistral-vibe-acp/zai-glm-5-3
+      - mistral-vibe-acp/zai-glm-5-3-flash
+      - mistral-vibe-acp/mistral-medium-latest
+      - mistral-vibe-acp/mistral-medium-3.5
+      - mistral-vibe-acp/deepseek-v4-1-flash-1017
+```
 
-The rotator imports Hermes' credential pool, which imports `ruamel.yaml`. Pin the plugin command to the Hermes venv interpreter that actually contains `ruamel`, not to whatever `python3` the gateway process resolves. A Python 3.14 gateway with a Python 3.11 Hermes venv otherwise starts the rotator and exits code 1 before `initialize`, with `ModuleNotFoundError: No module named 'ruamel'`.
+## Verify
 
-The warm slot must retain the child stderr stream. Discarding it hides this failure as an empty `stderr_tail`.
+```bash
+hermes chat --provider mistral-vibe-acp -m mistral-vibe-acp/mistral-large-4-0 -q 'Reply with exactly: ACP_FIX_OK' -Q
+```
 
-## Porting to another ACP harness
+Expected: `ACP_FIX_OK`.
 
-1. Point `command`/`args` at your harness (directly, or through a wrapper if it reads a key from env).
-2. Confirm the harness supports `session/close` (ACP v1: idle-only, idempotent). If not, drop the close call and accept session accumulation, or reap via the harness's delete extension.
-3. Keep per-turn session freshness; only the PROCESS is warm.
+## Repository layout
 
-## Measured numbers
+- `model-providers/mistral-vibe-acp/__init__.py` — Hermes provider, warm client, image-path bridge, and stderr capture
+- `model-providers/mistral-vibe-acp/plugin.yaml` — plugin manifest
+- `scripts/vibe_acp_rotator.py` — pool-key selector and `vibe-acp` launcher
+- `mistral_vibe_acp_provider.py` and `vibe_acp_rotator.py` — compatibility copies of the same two Python files
 
-Live battery (2026-11-23, real pool keys, real prompts):
+## Warm-session rules
 
-- cold turn (fresh worker, initialize included): 8.4–13.2s
-- warm turns: 2.6 / 4.2 / 4.8s
-- after SIGKILL of the warm proc (respawn + cold): 10.5s
-- warm `list_models`: 0.9–1.3s
-- model-time variance (1.2–20s on identical prompts) is backend capacity, not ACP overhead
+- Keep the harness process warm.
+- Start a fresh ACP session for every turn.
+- Do not reuse one ACP session across turns unless prompt formatting also changes. Resending a full transcript into a session that already holds it duplicates history.
+- A bad key cannot be swapped inside a live process. Kill that slot and respawn with the next pool key.
+- Keep child stderr. The warm slot used to discard it, which hid the real exit reason.
 
-## Live Discord verification (2026-11-24)
+## Interpreter failure
 
-A Discord ACP turn on `mistral-vibe-acp/mistral-large-4-0` completed on the ACP provider itself: one API call, `finish_reason=stop`, no fallback. The failing gateway path had been spawning the rotator with `python3` under Python 3.14, where `ruamel` was absent. The fixed plugin spawns `/usr/local/lib/hermes-agent/venv/bin/python3`, and the isolated request returned `ACP_FIX_OK` before the live Discord turn.
+If the gateway runs Python 3.14 but the Hermes venv is Python 3.11, spawning the rotator with plain `python3` can fail before `initialize`:
+
+```text
+ModuleNotFoundError: No module named 'ruamel'
+```
+
+The shipped plugin avoids that by using:
+
+```text
+/usr/local/lib/hermes-agent/venv/bin/python3
+```
+
+## Verified
+
+On 2026-11-24, a live Discord turn on `mistral-vibe-acp/mistral-large-4-0` completed on the ACP provider itself: one API call, `finish_reason=stop`, no fallback.
+
+Earlier measurements from 2026-11-23:
+
+- cold turn: 8.4–13.2 seconds
+- warm turns: 2.6, 4.2, and 4.8 seconds
+- SIGKILL recovery: 10.5 seconds
+- warm `list_models`: 0.9–1.3 seconds
