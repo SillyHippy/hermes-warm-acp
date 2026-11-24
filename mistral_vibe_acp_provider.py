@@ -210,7 +210,16 @@ class WarmACPClient:
         )
 
         tpl = self._template()
-        slot = self._acquire_slot()
+        slot = None
+        for _spawn_attempt in range(3):
+            try:
+                slot = self._acquire_slot()
+                break
+            except Exception as _acq_err:
+                _dbg_log("acquire attempt %d failed: %r" % (_spawn_attempt + 1, _acq_err))
+                if _spawn_attempt == 2:
+                    raise
+                time.sleep(1.0)
         proc = slot.proc
         deadline = time.monotonic() + timeout_seconds
         healthy = True
@@ -244,7 +253,15 @@ class WarmACPClient:
                         raise RuntimeError(f"Warm ACP {method} failed: {(msg.get('error') or {}).get('message') or msg.get('error')}")
                     return msg.get("result")
                 if proc.poll() is not None:
-                    raise RuntimeError(f"Warm ACP process exited early (exit code {proc.returncode}).")
+                    _tail = ""
+                    try:
+                        _err = getattr(proc, "stderr", None)
+                        if _err is not None:
+                            _tail = _err.read()[-600:]
+                    except Exception:
+                        _tail = ""
+                    _dbg_log("rotator died rc=%s; stderr tail: %r" % (proc.returncode, _tail))
+                    raise RuntimeError(f"Warm ACP process exited early (exit code {proc.returncode}). stderr_tail: {_tail!r}")
                 raise TimeoutError(f"Timed out waiting for warm ACP response to {method}.")
 
             # initialize once per process (first checkout on this proc)
