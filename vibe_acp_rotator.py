@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """vibe-acp key rotator — one Vibe allowance key per ACP session.
 
@@ -14,6 +15,13 @@ Stdio is a transparent pipe either way, so Hermes' ACP client sees one process.
 """
 
 from __future__ import annotations
+import os as _os, time as _time
+try:
+    with open("/root/.hermes/logs/rotator_boot.log", "a") as _f:
+        _f.write("%s boot pid=%s ppid=%s cwd=%s argv=%r\n" % (_time.strftime("%H:%M:%S"), _os.getpid(), _os.getppid(), _os.getcwd(), __import__("sys").argv))
+except Exception:
+    pass
+
 
 import os
 import re

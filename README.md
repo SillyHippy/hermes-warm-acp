@@ -40,7 +40,14 @@ SIGKILLed the warm process mid-life → next turn auto-respawned and answered in
 
 ## Files
 
-- `mistral_vibe_acp_provider.py` — drop-in Hermes provider plugin (`model-providers/mistral-vibe-acp/__init__.py`), including the key-rotator wiring (`vibe_acp_rotator.py`, not included: selects the next live key from the host's credential pool, spawns the harness with it, benches+rotates on 401/402/429)
+- `mistral_vibe_acp_provider.py` — drop-in Hermes provider plugin (`model-providers/mistral-vibe-acp/__init__.py`)
+- `vibe_acp_rotator.py` — selects the next live key from the host's credential pool, spawns the harness with it, and benches/rotates on 401/402/429
+
+## Interpreter requirement
+
+The rotator imports Hermes' credential pool, which imports `ruamel.yaml`. Pin the plugin command to the Hermes venv interpreter that actually contains `ruamel`, not to whatever `python3` the gateway process resolves. A Python 3.14 gateway with a Python 3.11 Hermes venv otherwise starts the rotator and exits code 1 before `initialize`, with `ModuleNotFoundError: No module named 'ruamel'`.
+
+The warm slot must retain the child stderr stream. Discarding it hides this failure as an empty `stderr_tail`.
 
 ## Porting to another ACP harness
 
@@ -57,3 +64,7 @@ Live battery (2026-11-23, real pool keys, real prompts):
 - after SIGKILL of the warm proc (respawn + cold): 10.5s
 - warm `list_models`: 0.9–1.3s
 - model-time variance (1.2–20s on identical prompts) is backend capacity, not ACP overhead
+
+## Live Discord verification (2026-11-24)
+
+A Discord ACP turn on `mistral-vibe-acp/mistral-large-4-0` completed on the ACP provider itself: one API call, `finish_reason=stop`, no fallback. The failing gateway path had been spawning the rotator with `python3` under Python 3.14, where `ruamel` was absent. The fixed plugin spawns `/usr/local/lib/hermes-agent/venv/bin/python3`, and the isolated request returned `ACP_FIX_OK` before the live Discord turn.

@@ -47,7 +47,7 @@ def _dbg_log(msg):
             _f.write(_t.strftime("%H:%M:%S") + " " + str(msg) + "\n")
     except Exception:
         pass
-_COMMAND = "python3"
+_COMMAND = "/usr/local/lib/hermes-agent/venv/bin/python3"
 _ARGS = ("/root/.hermes/scripts/vibe_acp_rotator.py",)
 
 # Errors that mean the WORKER's key is bad (rotate) rather than the prompt bad.
@@ -98,7 +98,8 @@ class _WarmSlot:
                 return
 
         threading.Thread(target=_pump, args=(proc.stdout, lambda line: self.inbox.put(_decode(line))), daemon=True).start()
-        threading.Thread(target=_pump, args=(proc.stderr, lambda line: None), daemon=True).start()
+        self.stderr_lines: list[str] = []
+        threading.Thread(target=_pump, args=(proc.stderr, lambda line: self.stderr_lines.append(line)), daemon=True).start()
 
 
 class WarmACPClient:
@@ -168,10 +169,16 @@ class WarmACPClient:
         """Spawn a fresh warm process using the base client's real _spawn."""
         from agent.acp_client import ACPClient
 
+        _dbg_log("spawn_slot: template kwargs=%r" % (self._template_kwargs,))
         tmp = ACPClient(**self._template_kwargs)
         if not hasattr(tmp, "_spawn"):
             raise RuntimeError("ACPClient spawn unavailable")
-        proc = tmp._spawn()
+        try:
+            proc = tmp._spawn()
+        except Exception as _spawn_exc:
+            _dbg_log("spawn_slot: _spawn RAISED %r" % (_spawn_exc,))
+            raise
+        _dbg_log("spawn_slot: pid=%s args=%r" % (getattr(proc, "pid", None), getattr(proc, "args", None)))
         self._active_processes.add(proc)
         self._spawn_count += 1
         return _WarmSlot(proc)
@@ -246,8 +253,9 @@ class WarmACPClient:
                 if proc.poll() is not None:
                     _tail = ""
                     try:
+                        _tail = "".join(getattr(slot, "stderr_lines", []) or [])[-600:]
                         _err = getattr(proc, "stderr", None)
-                        if _err is not None:
+                        if not _tail and _err is not None:
                             _tail = _err.read()[-600:]
                     except Exception:
                         _tail = ""
