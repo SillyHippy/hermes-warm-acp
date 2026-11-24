@@ -250,6 +250,10 @@ class WarmACPClient:
                 return _session_model_ids(session, tpl.model_entry_disabled)
             # model selection: identical semantics to base (degrade to default)
             requested_model = str(model or "").strip()
+            # Hermes passes full ids like "mistral-vibe-acp/zai-glm-5-3"; the harness
+            # advertises bare ids. Strip the provider prefix before matching.
+            if "/" in requested_model:
+                requested_model = requested_model.split("/", 1)[1]
             if requested_model and requested_model != tpl.placeholder_model:
                 try:
                     selection = _model_selection_request(
@@ -373,13 +377,50 @@ class WarmACPClient:
         messages = messages or []
         prompt_text = _format_messages_as_prompt(messages, model=model)
         if stream:
-            text, reasoning = self._drive_streaming_session(
-                timeout_seconds=_effective_timeout(timeout), model=model, prompt_text=prompt_text,
-            )
-        else:
-            text, reasoning = self._drive_session(
-                timeout_seconds=_effective_timeout(timeout), model=model, prompt_text=prompt_text,
-            )
+            # Streaming facade: consume the live-chunk generator and yield
+            # OpenAI-style stream chunks (this function itself returns an iterator).
+            def _stream_facade():
+                mid = model or self.placeholder_model
+                emitted = 0
+                stream_id = f"chatcmpl-acp-{time.time_ns()}"
+                def _chunk(delta_text: str):
+                    return {
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": mid,
+                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": delta_text}, "finish_reason": None}],
+                    }
+                gen = self._drive_streaming_session(
+                    timeout_seconds=_effective_timeout(timeout), model=model, prompt_text=prompt_text,
+                )
+                for piece in gen:
+                    if isinstance(piece, str) and piece:
+                        yield _chunk(piece)
+                    emitted += 1
+                final_holder = getattr(self, "_stream_state", None) or {}
+                text = final_holder.get("final_text") or ""
+                tool_calls, cleaned_text = _extract_tool_calls_from_text(text)
+                if tool_calls:
+                    yield {
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": mid,
+                        "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": tool_calls}, "finish_reason": None}],
+                    }
+                yield {
+                    "id": stream_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": mid,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+
+            return _stream_facade()
+        text, reasoning = self._drive_session(
+            timeout_seconds=_effective_timeout(timeout), model=model, prompt_text=prompt_text,
+        )
         tool_calls, cleaned_text = _extract_tool_calls_from_text(text)
         from types import SimpleNamespace
 
