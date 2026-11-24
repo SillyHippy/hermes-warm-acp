@@ -51,8 +51,12 @@ def _prefixed(model: str) -> str:
 
 # Best-guess catalog for the picker before a live session advertises models.
 _FALLBACK_MODELS = (
+    _prefixed("zai-glm-5-3"),
+    _prefixed("zai-glm-5-3-flash"),
     _prefixed("mistral-large-4-0"),
+    _prefixed("mistral-medium-latest"),
     _prefixed("mistral-medium-3.5"),
+    _prefixed("deepseek-v4-1-flash-1017"),
 )
 
 
