@@ -38,6 +38,14 @@ from typing import Any
 from providers import register_provider
 from providers.base import ProviderProfile
 
+
+def _dbg_log(msg):
+    try:
+        import time as _t, traceback as _tb
+        with open("/root/.hermes/logs/vibe_plugin_debug.log", "a") as _f:
+            _f.write(_t.strftime("%H:%M:%S") + " " + str(msg) + "\n")
+    except Exception:
+        pass
 _COMMAND = "python3"
 _ARGS = ("/root/.hermes/scripts/vibe_acp_rotator.py",)
 
@@ -370,7 +378,19 @@ class WarmACPClient:
         result_holder["final_text"], result_holder["final_reasoning"] = text, reasoning
 
     # -- OpenAI facade -------------------------------------------------------
-    def _create_chat_completion(self, *, model: str | None = None, messages: list[dict[str, Any]] | None = None,
+    def _create_chat_completion(self, *args, **kwargs):
+        _dbg_log("_create_chat_completion enter")
+        try:
+            _r = self._create_chat_completion_inner(*args, **kwargs)
+            _dbg_log("_create_chat_completion OK")
+            return _r
+        except Exception as _e:
+            import traceback as _tb
+            _dbg_log("_create_chat_completion FAILED: " + repr(_e))
+            _dbg_log(_tb.format_exc())
+            raise
+
+    def _create_chat_completion_inner(self, *, model: str | None = None, messages: list[dict[str, Any]] | None = None,
                                 timeout: float | None = None, stream: bool = False, **__: Any) -> Any:
         from agent.acp_client import _effective_timeout, _extract_tool_calls_from_text, _completion_to_stream_chunks
 
@@ -460,6 +480,18 @@ class MistralVibeACPProfile(ProviderProfile):
     """Mistral Vibe ACP — warm external process over stdio, no REST models endpoint."""
 
     def create_client(self, **client_kwargs: Any) -> Any:
+        _dbg_log("create_client called kwargs=%s" % sorted(client_kwargs))
+        try:
+            _c = self._create_client_inner(**client_kwargs)
+            _dbg_log("create_client OK -> %r" % type(_c).__name__)
+            return _c
+        except Exception as _e:
+            import traceback as _tb
+            _dbg_log("create_client FAILED: " + repr(_e))
+            _dbg_log(_tb.format_exc())
+            raise
+
+    def _create_client_inner(self, **client_kwargs: Any) -> Any:
         kwargs = dict(client_kwargs)
         kwargs.setdefault("command", _COMMAND)
         kwargs.setdefault("args", list(_ARGS))
@@ -490,7 +522,7 @@ class MistralVibeACPProfile(ProviderProfile):
 
 mistral_vibe_acp = MistralVibeACPProfile(
     name="mistral-vibe-acp",
-    aliases=("mistral_vibe_acp", "vibe-acp"),
+    aliases=("mistral_vibe_acp", "vibe-acp", "custom:mistral-vibe-acp"),
     api_mode="chat_completions",
     env_vars=(),
     base_url="acp://mistral-vibe-acp",
