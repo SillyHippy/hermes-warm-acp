@@ -210,16 +210,7 @@ class WarmACPClient:
         )
 
         tpl = self._template()
-        slot = None
-        for _spawn_attempt in range(3):
-            try:
-                slot = self._acquire_slot()
-                break
-            except Exception as _acq_err:
-                _dbg_log("acquire attempt %d failed: %r" % (_spawn_attempt + 1, _acq_err))
-                if _spawn_attempt == 2:
-                    raise
-                time.sleep(1.0)
+        slot = self._acquire_slot()
         proc = slot.proc
         deadline = time.monotonic() + timeout_seconds
         healthy = True

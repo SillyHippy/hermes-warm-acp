@@ -38,7 +38,12 @@ def _pool():
     return load_pool(POOL)
 
 
+def _heartbeat(msg: str) -> None:
+    print(f"[vibe-rotator] {msg}", file=sys.stderr, flush=True)
+
+
 def _pick():
+    _heartbeat("alive; resolving pool")
     entry = _pool().select()
     if entry is None or not entry.runtime_api_key:
         return None
@@ -118,6 +123,17 @@ def main() -> int:
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        _heartbeat("starting main")
+        try:
+            rc = main()
+            _heartbeat(f"main returned {rc}")
+            sys.exit(rc)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            import traceback
+            _heartbeat("CRASH: " + repr(exc))
+            _heartbeat(traceback.format_exc()[-500:])
+            sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(130)
