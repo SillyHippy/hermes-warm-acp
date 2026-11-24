@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import queue
 import threading
 import time
@@ -469,11 +470,75 @@ class WarmACPClient:
             self.is_closed = True
 
 
-def _format_messages_as_prompt(messages: list[dict[str, Any]], *, model: str | None = None) -> str:
-    """Base-class exact formatter: preamble + transcript + continue line."""
-    from agent.acp_client import _format_messages_as_prompt as _base_format
+_VIBE_IMAGE_DIR = "/root/.hermes/cache/scratch/vibe_acp_images"
 
-    return _base_format(messages, model=model)
+
+def _save_acp_image(part: dict[str, Any]) -> str | None:
+    """Persist an OpenAI-style image part to disk; the vibe CLI reads it with its own vision."""
+    import base64 as _b64
+    import binascii
+    import uuid as _uuid
+    try:
+        info = part.get("image_url") or {}
+        url = info.get("url") or ""
+        ext = "png"
+        if url.startswith("data:"):
+            header, _, payload = url.partition(",")
+            try:
+                mime = header.split(";", 1)[0][5:]
+                ext = {"image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png",
+                       "image/webp": "webp", "image/gif": "gif"}.get(mime, "png")
+            except Exception:
+                pass
+            raw = _b64.b64decode(payload, validate=False)
+        elif url.startswith("http://") or url.startswith("https://"):
+            import urllib.request
+            with urllib.request.urlopen(url, timeout=60) as resp:
+                raw = resp.read()
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+            ext = {"image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png",
+                   "image/webp": "webp", "image/gif": "gif"}.get(ctype, "png")
+        else:
+            return None
+        os.makedirs(_VIBE_IMAGE_DIR, exist_ok=True)
+        path = os.path.join(_VIBE_IMAGE_DIR, f"img_{_uuid.uuid4().hex[:12]}.{ext}")
+        with open(path, "wb") as fh:
+            fh.write(raw)
+        return path
+    except Exception:
+        return None
+
+
+def _format_messages_as_prompt(messages: list[dict[str, Any]], *, model: str | None = None) -> str:
+    """Vision-aware formatter: BaseModel exact formatter, plus image parts saved to disk and
+    referenced by absolute path so the vibe CLI's vision models (e.g. GLM 5.3 Flash) can read them."""
+    import agent.acp_client as _acp_mod
+    saved: list[str] = []
+    stripped: list[dict[str, Any]] = []
+    for message in messages or []:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            new_parts: list[Any] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "image_url":
+                    path = _save_acp_image(item)
+                    if path:
+                        saved.append(path)
+                        new_parts.append({"type": "text", "text": f"[image attachment saved to disk: {path}]"})
+                else:
+                    new_parts.append(item)
+            stripped.append({**message, "content": new_parts})
+        else:
+            stripped.append(message)
+    if saved:
+        # Concrete read instruction: the harness CLI can open files via its own tools (e.g. cat an
+        # image through a vision model). One line per image keeps the ordering explicit.
+        note = "\n".join(
+            f"The user attached an image. It has been saved to the absolute path below; open and "
+            f"view it with your vision capability before answering: {p}" for p in saved
+        )
+        stripped.append({"role": "user", "content": [{"type": "text", "text": note}]})
+    return _acp_mod._format_messages_as_prompt(stripped, model=model)
 
 
 class MistralVibeACPProfile(ProviderProfile):
